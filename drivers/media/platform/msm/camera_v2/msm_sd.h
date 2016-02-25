@@ -50,10 +50,12 @@ struct msm_sd_close_ioctl {
 #define MSM_SD_CLOSE_1ST_CATEGORY  0x00010000
 #define MSM_SD_CLOSE_2ND_CATEGORY  0x00020000
 #define MSM_SD_CLOSE_3RD_CATEGORY  0x00030000
+#define MSM_SD_CLOSE_4TH_CATEGORY  0x00040000
 
 struct msm_sd_subdev {
 	struct v4l2_subdev sd;
 	int close_seq;
+	struct list_head list;
 };
 
 struct msm_sd_req_sd {
@@ -65,8 +67,10 @@ struct msm_sd_req_vb2_q {
 	struct vb2_buffer *(*get_buf)(int session_id, unsigned int stream_id);
 	struct vb2_queue *(*get_vb2_queue)(int session_id,
 		unsigned int stream_id);
-	int (*put_buf)(struct vb2_buffer *vb2_buf);
-	int (*buf_done)(struct vb2_buffer *vb2_buf);
+	int (*put_buf)(struct vb2_buffer *vb2_buf, int session_id,
+		unsigned int stream_id);
+	int (*buf_done)(struct vb2_buffer *vb2_buf, int session_id,
+		unsigned int stream_id);
 };
 
 #define MSM_SD_NOTIFY_GET_SD 0x00000001

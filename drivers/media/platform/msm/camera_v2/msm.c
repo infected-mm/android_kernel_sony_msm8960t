@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -20,7 +20,6 @@
 #include <linux/spinlock.h>
 #include <linux/proc_fs.h>
 #include <linux/atomic.h>
-#include <linux/wait.h>
 #include <linux/videodev2.h>
 #include <linux/msm_ion.h>
 #include <linux/iommu.h>
@@ -29,81 +28,11 @@
 #include "msm.h"
 #include "msm_vb2.h"
 #include "msm_sd.h"
+#include <media/msmb_generic_buf_mgr.h>
 
-struct msm_queue_head {
-	struct list_head list;
-	spinlock_t lock;
-	int len;
-	int max;
-};
-
-/** msm_event:
- *
- *  event sent by imaging server
- **/
-struct msm_event {
-	struct video_device *vdev;
-	atomic_t on_heap;
-};
-
-struct msm_command {
-	struct list_head list;
-	struct v4l2_event event;
-	atomic_t on_heap;
-};
-
-/** struct msm_command_ack
- *
- *  Object of command_ack_q, which is
- *  created per open operation
- *
- *  contains struct msm_command
- **/
-struct msm_command_ack {
-	struct list_head list;
-	struct msm_queue_head command_q;
-	wait_queue_head_t wait;
-	int stream_id;
-};
-
-struct msm_stream {
-	struct list_head list;
-
-	/* stream index per session, same
-	 * as stream_id but set through s_parm */
-	unsigned int stream_id;
-
-	/* vb2 buffer handling */
-	struct vb2_queue *vb2_q;
-};
-
-struct msm_v4l2_subdev {
-	/* FIXME: for session close and error handling such
-	 * as daemon shutdown */
-	int    close_sequence;
-};
-
-struct msm_session {
-	struct list_head list;
-
-	/* session index */
-	unsigned int session_id;
-
-	/* event queue sent by imaging server */
-	struct msm_event event_q;
-
-	/* ACK by imaging server. Object type of
-	 * struct msm_command_ack per open,
-	 * assumption is application can send
-	 * command on every opened video node */
-	struct msm_queue_head command_ack_q;
-
-	/* real streams(either data or metadate) owned by one
-	 * session struct msm_stream */
-	struct msm_queue_head stream_q;
-};
 
 static struct v4l2_device *msm_v4l2_dev;
+static struct list_head    ordered_sd_list;
 
 static struct msm_queue_head *msm_session_q;
 
@@ -140,7 +69,7 @@ spinlock_t msm_pid_lock;
 		if (node->sd == q_node) {				\
 			__q->len--;				\
 			list_del_init(&node->member);		\
-			kfree(node);				\
+			kzfree(node);				\
 			break;					\
 		}						\
 	}							\
@@ -157,7 +86,7 @@ spinlock_t msm_pid_lock;
 		if (node == q_node) {				\
 			__q->len--;				\
 			list_del_init(&node->member);		\
-			kfree(node);				\
+			kzfree(node);				\
 			break;					\
 		}						\
 	}							\
@@ -176,7 +105,7 @@ spinlock_t msm_pid_lock;
 		if (node) {					\
 			if (&node->member) \
 				list_del_init(&node->member);		\
-			kfree(node);	\
+			kzfree(node);	\
 		}	\
 	}	\
 	spin_unlock_irqrestore(&__q->lock, flags);		\
@@ -258,6 +187,17 @@ static inline int __msm_queue_find_command_ack_q(void *d1, void *d2)
 	return (ack->stream_id == *(unsigned int *)d2) ? 1 : 0;
 }
 
+
+struct msm_session *msm_session_find(unsigned int session_id)
+{
+	struct msm_session *session;
+	session = msm_queue_find(msm_session_q, struct msm_session,
+		list, __msm_queue_find_session, &session_id);
+	if (WARN_ON(!session))
+		return NULL;
+	return session;
+}
+
 int msm_create_stream(unsigned int session_id,
 	unsigned int stream_id, struct vb2_queue *q)
 {
@@ -275,9 +215,11 @@ int msm_create_stream(unsigned int session_id,
 
 	stream->stream_id = stream_id;
 	stream->vb2_q = q;
-
+	spin_lock_init(&stream->stream_lock);
 	msm_enqueue(&session->stream_q, &stream->list);
 	session->stream_q.len++;
+
+	INIT_LIST_HEAD(&stream->queued_list);
 
 	return 0;
 }
@@ -286,6 +228,7 @@ void msm_delete_stream(unsigned int session_id, unsigned int stream_id)
 {
 	struct msm_session *session = NULL;
 	struct msm_stream  *stream = NULL;
+	unsigned long flags;
 
 	session = msm_queue_find(msm_session_q, struct msm_session,
 		list, __msm_queue_find_session, &session_id);
@@ -296,17 +239,20 @@ void msm_delete_stream(unsigned int session_id, unsigned int stream_id)
 		list, __msm_queue_find_stream, &stream_id);
 	if (!stream)
 		return;
-
+	spin_lock_irqsave(&(session->stream_q.lock), flags);
 	list_del_init(&stream->list);
 	session->stream_q.len--;
 	kfree(stream);
+	stream = NULL;
+	spin_unlock_irqrestore(&(session->stream_q.lock), flags);
+
 }
 
 static void msm_sd_unregister_subdev(struct video_device *vdev)
 {
 	struct v4l2_subdev *sd = video_get_drvdata(vdev);
 	sd->devnode = NULL;
-	kfree(vdev);
+	kzfree(vdev);
 }
 
 static inline int __msm_sd_register_subdev(struct v4l2_subdev *sd)
@@ -341,7 +287,7 @@ static inline int __msm_sd_register_subdev(struct v4l2_subdev *sd)
 	rc = __video_register_device(vdev, VFL_TYPE_SUBDEV, -1, 1,
 		  sd->owner);
 	if (rc < 0) {
-		kfree(vdev);
+		kzfree(vdev);
 		goto clean_up;
 	}
 
@@ -359,14 +305,29 @@ clean_up:
 	return rc;
 }
 
+static void msm_add_sd_in_position(struct msm_sd_subdev *msm_subdev,
+	struct list_head *sd_list)
+{
+	struct msm_sd_subdev *temp_sd;
+
+	list_for_each_entry(temp_sd, sd_list, list) {
+		if (msm_subdev->close_seq < temp_sd->close_seq) {
+			list_add_tail(&msm_subdev->list, &temp_sd->list);
+			return;
+		}
+	}
+	list_add_tail(&msm_subdev->list, sd_list);
+}
+
 int msm_sd_register(struct msm_sd_subdev *msm_subdev)
 {
 	if (WARN_ON(!msm_subdev))
 		return -EINVAL;
 
-	if (WARN_ON(!msm_v4l2_dev) && WARN_ON(!msm_v4l2_dev->dev))
+	if (WARN_ON(!msm_v4l2_dev) || WARN_ON(!msm_v4l2_dev->dev))
 		return -EIO;
 
+	msm_add_sd_in_position(msm_subdev, &ordered_sd_list);
 	return __msm_sd_register_subdev(&msm_subdev->sd);
 }
 
@@ -383,23 +344,33 @@ int msm_create_session(unsigned int session_id, struct video_device *vdev)
 {
 	struct msm_session *session = NULL;
 
-	if (!msm_session_q)
+	if (!msm_session_q) {
+		pr_err("%s : session queue not available Line %d\n",
+				__func__, __LINE__);
 		return -ENODEV;
+	}
 
 	session = msm_queue_find(msm_session_q, struct msm_session,
 		list, __msm_queue_find_session, &session_id);
-	if (session)
+	if (session) {
+		pr_err("%s : Session not found Line %d\n",
+				__func__, __LINE__);
 		return -EINVAL;
+	}
 
 	session = kzalloc(sizeof(*session), GFP_KERNEL);
-	if (!session)
+	if (!session) {
+		pr_err("%s : Memory not available Line %d\n",
+				__func__, __LINE__);
 		return -ENOMEM;
+	}
 
 	session->session_id = session_id;
 	session->event_q.vdev = vdev;
 	msm_init_queue(&session->command_ack_q);
 	msm_init_queue(&session->stream_q);
 	msm_enqueue(msm_session_q, &session->list);
+	mutex_init(&session->lock);
 	return 0;
 }
 
@@ -408,26 +379,36 @@ int msm_create_command_ack_q(unsigned int session_id, unsigned int stream_id)
 	struct msm_session *session;
 	struct msm_command_ack *cmd_ack;
 
-	if (!msm_session_q)
+	if (!msm_session_q) {
+		pr_err("%s : Session queue not available Line %d\n",
+				__func__, __LINE__);
 		return -ENODEV;
+	}
 
 	session = msm_queue_find(msm_session_q, struct msm_session,
 		list, __msm_queue_find_session, &session_id);
-	if (!session)
+	if (!session) {
+		pr_err("%s : Session not found Line %d\n",
+				__func__, __LINE__);
 		return -EINVAL;
-
+	}
+	mutex_lock(&session->lock);
 	cmd_ack = kzalloc(sizeof(*cmd_ack), GFP_KERNEL);
-	if (!cmd_ack)
+	if (!cmd_ack) {
+		mutex_unlock(&session->lock);
+		pr_err("%s : memory not available Line %d\n",
+				__func__, __LINE__);
 		return -ENOMEM;
+	}
 
 	msm_init_queue(&cmd_ack->command_q);
 	INIT_LIST_HEAD(&cmd_ack->list);
-	init_waitqueue_head(&cmd_ack->wait);
+	init_completion(&cmd_ack->wait_complete);
 	cmd_ack->stream_id = stream_id;
 
 	msm_enqueue(&session->command_ack_q, &cmd_ack->list);
 	session->command_ack_q.len++;
-
+	mutex_unlock(&session->lock);
 	return 0;
 }
 
@@ -435,45 +416,41 @@ void msm_delete_command_ack_q(unsigned int session_id, unsigned int stream_id)
 {
 	struct msm_session *session;
 	struct msm_command_ack *cmd_ack;
+	unsigned long flags;
 
 	session = msm_queue_find(msm_session_q, struct msm_session,
 		list, __msm_queue_find_session, &session_id);
 	if (!session)
 		return;
+	mutex_lock(&session->lock);
 
 	cmd_ack = msm_queue_find(&session->command_ack_q,
 		struct msm_command_ack,	list, __msm_queue_find_command_ack_q,
 		&stream_id);
-	if (!cmd_ack)
+	if (!cmd_ack) {
+		mutex_unlock(&session->lock);
 		return;
+	}
 
 	msm_queue_drain(&cmd_ack->command_q, struct msm_command, list);
+
+	spin_lock_irqsave(&(session->command_ack_q.lock), flags);
+	list_del_init(&cmd_ack->list);
+	kzfree(cmd_ack);
+	session->command_ack_q.len--;
+	spin_unlock_irqrestore(&(session->command_ack_q.lock), flags);
+	mutex_unlock(&session->lock);
 }
 
-static inline int __msm_v4l2_subdev_shutdown(struct v4l2_subdev *sd)
-{
-	return 0;
-}
-
-static void msm_sd_try_shutdown(void)
-{
-	unsigned long flags;
-	struct v4l2_subdev *sd;
-
-	/* release all subdev's resource */
-	spin_lock_irqsave(&msm_v4l2_dev->lock, flags);
-	if (!list_empty(&msm_v4l2_dev->subdevs)) {
-		list_for_each_entry(sd, &msm_v4l2_dev->subdevs, list)
-			__msm_v4l2_subdev_shutdown(sd);
-	}
-	spin_unlock_irqrestore(&msm_v4l2_dev->lock, flags);
-}
-
-static inline int __msm_sd_close_session_streams(struct v4l2_subdev *sd,
+static inline int __msm_sd_close_subdevs(struct msm_sd_subdev *msm_sd,
 	struct msm_sd_close_ioctl *sd_close)
 {
-	v4l2_subdev_call(sd, core, ioctl,
-		MSM_SD_CLOSE_SESSION_AND_STREAM, &sd_close);
+	struct v4l2_subdev *sd;
+	sd = &msm_sd->sd;
+	pr_debug("%s: Shutting down subdev %s", __func__, sd->name);
+
+	v4l2_subdev_call(sd, core, ioctl, MSM_SD_SHUTDOWN, sd_close);
+	v4l2_subdev_call(sd, core, s_power, 0);
 
 	return 0;
 }
@@ -481,34 +458,23 @@ static inline int __msm_sd_close_session_streams(struct v4l2_subdev *sd,
 static inline int __msm_destroy_session_streams(void *d1, void *d2)
 {
 	struct msm_stream *stream = d1;
-	struct msm_sd_close_ioctl *sd_close = d2;
-	struct v4l2_subdev *sd;
 	unsigned long flags;
 
-	sd_close->stream = stream->stream_id;
-
-	spin_lock_irqsave(&msm_v4l2_dev->lock, flags);
-	if (!list_empty(&msm_v4l2_dev->subdevs))
-		list_for_each_entry(sd, &msm_v4l2_dev->subdevs, list)
-			__msm_sd_close_session_streams(sd, sd_close);
-	spin_unlock_irqrestore(&msm_v4l2_dev->lock, flags);
-
+	pr_err("%s: Error: Destroyed list is not empty\n", __func__);
+	spin_lock_irqsave(&stream->stream_lock, flags);
+	INIT_LIST_HEAD(&stream->queued_list);
+	spin_unlock_irqrestore(&stream->stream_lock, flags);
 	return 0;
 }
 
 static void msm_destroy_session_streams(struct msm_session *session)
 {
-	struct msm_sd_close_ioctl sd_close;
 
-	/* to ensure error handling purpose, it needs to detach all subdevs
-	 * which are being connected to streams */
 	if (!session)
 		return;
 
-	sd_close.session = session->session_id;
-
 	msm_queue_traverse_action(&session->stream_q, struct msm_stream, list,
-		__msm_destroy_session_streams, &sd_close);
+		__msm_destroy_session_streams, NULL);
 
 	msm_queue_drain(&session->stream_q, struct msm_stream, list);
 }
@@ -517,6 +483,9 @@ static inline int __msm_remove_session_cmd_ack_q(void *d1, void *d2)
 {
 	struct msm_command_ack *cmd_ack = d1;
 
+	if (!(&cmd_ack->command_q))
+		return 0;
+
 	msm_queue_drain(&cmd_ack->command_q, struct msm_command, list);
 
 	return 0;
@@ -524,9 +493,10 @@ static inline int __msm_remove_session_cmd_ack_q(void *d1, void *d2)
 
 static void msm_remove_session_cmd_ack_q(struct msm_session *session)
 {
-	if (!session)
+	if ((!session) || !(&session->command_ack_q))
 		return;
 
+	mutex_lock(&session->lock);
 	/* to ensure error handling purpose, it needs to detach all subdevs
 	 * which are being connected to streams */
 	msm_queue_traverse_action(&session->command_ack_q,
@@ -534,11 +504,15 @@ static void msm_remove_session_cmd_ack_q(struct msm_session *session)
 		__msm_remove_session_cmd_ack_q, NULL);
 
 	msm_queue_drain(&session->command_ack_q, struct msm_command_ack, list);
+
+	mutex_unlock(&session->lock);
 }
 
 int msm_destroy_session(unsigned int session_id)
 {
 	struct msm_session *session;
+	struct v4l2_subdev *buf_mgr_subdev;
+	struct msm_sd_close_ioctl session_info;
 
 	session = msm_queue_find(msm_session_q, struct msm_session,
 		list, __msm_queue_find_session, &session_id);
@@ -547,24 +521,48 @@ int msm_destroy_session(unsigned int session_id)
 
 	msm_destroy_session_streams(session);
 	msm_remove_session_cmd_ack_q(session);
-
+	mutex_destroy(&session->lock);
 	msm_delete_entry(msm_session_q, struct msm_session,
 		list, session);
+	buf_mgr_subdev = msm_buf_mngr_get_subdev();
+	if (buf_mgr_subdev) {
+		session_info.session = session_id;
+		session_info.stream = 0;
+		v4l2_subdev_call(buf_mgr_subdev, core, ioctl,
+			MSM_SD_SHUTDOWN, &session_info);
+	} else {
+		pr_err("%s: Buff manger device node is NULL\n", __func__);
+	}
+
+	return 0;
+}
+
+static int __msm_close_destry_session_notify_apps(void *d1, void *d2)
+{
+	struct v4l2_event event;
+	struct msm_v4l2_event_data *event_data =
+		(struct msm_v4l2_event_data *)&event.u.data[0];
+	struct msm_session *session = d1;
+
+	event.type = MSM_CAMERA_V4L2_EVENT_TYPE;
+	event.id   = MSM_CAMERA_MSM_NOTIFY;
+	event_data->command = MSM_CAMERA_PRIV_SHUTDOWN;
+
+	v4l2_event_queue(session->event_q.vdev, &event);
 
 	return 0;
 }
 
 static long msm_private_ioctl(struct file *file, void *fh,
-	bool valid_prio, int cmd, void *arg)
+	bool valid_prio, unsigned int cmd, void *arg)
 {
 	int rc = 0;
-	struct msm_v4l2_event_data *event_data;
+	struct msm_v4l2_event_data *event_data = arg;
+	struct v4l2_event event;
 	struct msm_session *session;
 	unsigned int session_id;
 	unsigned int stream_id;
-
-	event_data = (struct msm_v4l2_event_data *)
-		((struct v4l2_event *)arg)->u.data;
+	unsigned long spin_flags = 0;
 
 	session_id = event_data->session_id;
 	stream_id = event_data->stream_id;
@@ -581,9 +579,12 @@ static long msm_private_ioctl(struct file *file, void *fh,
 			rc = -EFAULT;
 			break;
 		}
-
+		event.type = event_data->v4l2_event_type;
+		event.id = event_data->v4l2_event_id;
+		memcpy(&event.u.data, event_data,
+			sizeof(struct msm_v4l2_event_data));
 		v4l2_event_queue(session->event_q.vdev,
-			(struct v4l2_event *)arg);
+			&event);
 	}
 		break;
 
@@ -602,15 +603,30 @@ static long msm_private_ioctl(struct file *file, void *fh,
 			__msm_queue_find_command_ack_q,
 			&stream_id);
 		if (WARN_ON(!cmd_ack)) {
-			kfree(ret_cmd);
+			kzfree(ret_cmd);
 			rc = -EFAULT;
 			break;
 		}
 
-		ret_cmd->event = *(struct v4l2_event *)arg;
+		spin_lock_irqsave(&(session->command_ack_q.lock),
+		   spin_flags);
+		event.type = event_data->v4l2_event_type;
+		event.id = event_data->v4l2_event_id;
+		memcpy(&event.u.data, event_data,
+			sizeof(struct msm_v4l2_event_data));
+		memcpy(&ret_cmd->event, &event, sizeof(struct v4l2_event));
 		msm_enqueue(&cmd_ack->command_q, &ret_cmd->list);
-		wake_up(&cmd_ack->wait);
+		complete(&cmd_ack->wait_complete);
+		spin_unlock_irqrestore(&(session->command_ack_q.lock),
+		   spin_flags);
 	}
+		break;
+
+	case MSM_CAM_V4L2_IOCTL_NOTIFY_ERROR:
+		/* send v4l2_event to HAL next*/
+		msm_queue_traverse_action(msm_session_q,
+			struct msm_session, list,
+			__msm_close_destry_session_notify_apps, NULL);
 		break;
 
 	default:
@@ -622,15 +638,15 @@ static long msm_private_ioctl(struct file *file, void *fh,
 }
 
 static int msm_unsubscribe_event(struct v4l2_fh *fh,
-	struct v4l2_event_subscription *sub)
+	const struct v4l2_event_subscription *sub)
 {
 	return v4l2_event_unsubscribe(fh, sub);
 }
 
 static int msm_subscribe_event(struct v4l2_fh *fh,
-	struct v4l2_event_subscription *sub)
+	const struct v4l2_event_subscription *sub)
 {
-	return v4l2_event_subscribe(fh, sub, 5);
+	return v4l2_event_subscribe(fh, sub, 5, NULL);
 }
 
 static const struct v4l2_ioctl_ops g_msm_ioctl_ops = {
@@ -655,6 +671,18 @@ static unsigned int msm_poll(struct file *f,
 	return rc;
 }
 
+static void msm_print_event_error(struct v4l2_event *event)
+{
+	struct msm_v4l2_event_data *event_data =
+		(struct msm_v4l2_event_data *)&event->u.data[0];
+
+	pr_err("Evt_type=%x Evt_id=%d Evt_cmd=%x\n", event->type,
+		event->id, event_data->command);
+	pr_err("Evt_session_id=%d Evt_stream_id=%d Evt_arg=%d\n",
+		event_data->session_id, event_data->stream_id,
+		event_data->arg_value);
+}
+
 /* something seriously wrong if msm_close is triggered
  *   !!! user space imaging server is shutdown !!!
  */
@@ -676,6 +704,8 @@ int msm_post_event(struct v4l2_event *event, int timeout)
 	spin_lock_irqsave(&msm_eventq_lock, flags);
 	if (!msm_eventq) {
 		spin_unlock_irqrestore(&msm_eventq_lock, flags);
+		pr_err("%s : msm event queue not available Line %d\n",
+				__func__, __LINE__);
 		return -ENODEV;
 	}
 	spin_unlock_irqrestore(&msm_eventq_lock, flags);
@@ -685,66 +715,82 @@ int msm_post_event(struct v4l2_event *event, int timeout)
 	/* send to imaging server and wait for ACK */
 	session = msm_queue_find(msm_session_q, struct msm_session,
 		list, __msm_queue_find_session, &session_id);
-	if (WARN_ON(!session))
+	if (WARN_ON(!session)) {
+		pr_err("%s : session not found Line %d\n",
+				__func__, __LINE__);
 		return -EIO;
-
+	}
+	mutex_lock(&session->lock);
 	cmd_ack = msm_queue_find(&session->command_ack_q,
 		struct msm_command_ack, list,
 		__msm_queue_find_command_ack_q, &stream_id);
-	if (WARN_ON(!cmd_ack))
+	if (WARN_ON(!cmd_ack)) {
+		mutex_unlock(&session->lock);
+		pr_err("%s : cmd_ack not found Line %d\n",
+				__func__, __LINE__);
 		return -EIO;
+	}
+
+	/*re-init wait_complete */
+	INIT_COMPLETION(cmd_ack->wait_complete);
 
 	v4l2_event_queue(vdev, event);
 
-	if (timeout < 0)
+	if (timeout < 0) {
+		mutex_unlock(&session->lock);
+		pr_err("%s : timeout cannot be negative Line %d\n",
+				__func__, __LINE__);
 		return rc;
+	}
 
 	/* should wait on session based condition */
-	rc = wait_event_interruptible_timeout(cmd_ack->wait,
-		!list_empty_careful(&cmd_ack->command_q.list),
-		msecs_to_jiffies(timeout));
+	rc = wait_for_completion_timeout(&cmd_ack->wait_complete,
+			msecs_to_jiffies(timeout));
+
+
 	if (list_empty_careful(&cmd_ack->command_q.list)) {
-		if (!rc)
-			rc = -ETIMEDOUT;
-		if (rc < 0)
-			return rc;
+		if (!rc) {
+			pr_err("%s: Timed out\n", __func__);
+			msm_print_event_error(event);
+			mutex_unlock(&session->lock);
+			return -ETIMEDOUT;
+		} else {
+			pr_err("%s: Error: No timeout but list empty!",
+					__func__);
+			msm_print_event_error(event);
+			mutex_unlock(&session->lock);
+			return -EINVAL;
+		}
 	}
 
 	cmd = msm_dequeue(&cmd_ack->command_q,
 		struct msm_command, list);
-	if (!cmd)
+	if (!cmd) {
+		mutex_unlock(&session->lock);
+		pr_err("%s : cmd dequeue failed Line %d\n",
+				__func__, __LINE__);
 		return -EINVAL;
+	}
 
 	event_data = (struct msm_v4l2_event_data *)cmd->event.u.data;
 
 	/* compare cmd_ret and event */
 	if (WARN_ON(event->type != cmd->event.type) ||
-			WARN_ON(event->id != cmd->event.id))
+			WARN_ON(event->id != cmd->event.id)) {
+		pr_err("%s : Either event type or id didnot match Line %d\n",
+				__func__, __LINE__);
+		pr_err("%s : event->type %d event->id %d\n", __func__,
+				event->type, event->id);
+		pr_err("%s : cmd->event.type %d cmd->event.id %d\n", __func__,
+				cmd->event.type, cmd->event.id);
 		rc = -EINVAL;
+	}
 
 	*event = cmd->event;
 
-	kfree(cmd);
+	kzfree(cmd);
+	mutex_unlock(&session->lock);
 	return rc;
-}
-
-static int __msm_close_destry_session_notify_apps(void *d1, void *d2)
-{
-	struct v4l2_event event;
-	struct msm_v4l2_event_data *event_data =
-		(struct msm_v4l2_event_data *)&event.u.data[0];
-	struct msm_session *session = d1;
-
-	event.type = MSM_CAMERA_V4L2_EVENT_TYPE;
-	event.id   = MSM_CAMERA_MSM_NOTIFY;
-	event_data->command = MSM_CAMERA_PRIV_SHUTDOWN;
-
-	v4l2_event_queue(session->event_q.vdev, &event);
-
-	msm_destroy_session_streams(session);
-	msm_remove_session_cmd_ack_q(session);
-
-	return 0;
 }
 
 static int msm_close(struct file *filep)
@@ -752,21 +798,22 @@ static int msm_close(struct file *filep)
 	int rc = 0;
 	unsigned long flags;
 	struct msm_video_device *pvdev = video_drvdata(filep);
+	struct msm_sd_close_ioctl sd_close;
+	struct msm_sd_subdev *msm_sd;
 
-	/* 1st thing 1st, send v4l2_event to HAL immediately,
-	 * to ensure error handling purpose, it needs to detach all subdevs
-	 * which are being connected to streams */
+	/*stop all hardware blocks immediately*/
+	if (!list_empty(&msm_v4l2_dev->subdevs))
+		list_for_each_entry(msm_sd, &ordered_sd_list, list)
+			__msm_sd_close_subdevs(msm_sd, &sd_close);
+
+	/* send v4l2_event to HAL next*/
 	msm_queue_traverse_action(msm_session_q, struct msm_session, list,
 		__msm_close_destry_session_notify_apps, NULL);
-
-	msm_queue_drain(msm_session_q, struct msm_session, list);
 
 	spin_lock_irqsave(&msm_eventq_lock, flags);
 	msm_eventq = NULL;
 	spin_unlock_irqrestore(&msm_eventq_lock, flags);
 	v4l2_fh_release(filep);
-
-	msm_sd_try_shutdown();
 
 	spin_lock_irqsave(&msm_pid_lock, flags);
 	put_pid(msm_pid);
@@ -794,7 +841,6 @@ static int msm_open(struct file *filep)
 	int rc;
 	unsigned long flags;
 	struct msm_video_device *pvdev = video_drvdata(filep);
-
 	BUG_ON(!pvdev);
 
 	/* !!! only ONE open is allowed !!! */
@@ -825,6 +871,9 @@ static struct v4l2_file_operations msm_fops = {
 	.poll   = msm_poll,
 	.release = msm_close,
 	.ioctl   = video_ioctl2,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl32 = video_ioctl2,
+#endif
 };
 
 struct msm_stream *msm_get_stream(unsigned int session_id,
@@ -866,20 +915,48 @@ struct vb2_queue *msm_get_stream_vb2q(unsigned int session_id,
 	return stream->vb2_q;
 }
 
+struct msm_stream *msm_get_stream_from_vb2q(struct vb2_queue *q)
+{
+	struct msm_session *session;
+	struct msm_stream *stream;
+	unsigned long flags1;
+	unsigned long flags2;
+	spin_lock_irqsave(&msm_session_q->lock, flags1);
+	list_for_each_entry(session, &(msm_session_q->list), list) {
+		spin_lock_irqsave(&(session->stream_q.lock), flags2);
+		list_for_each_entry(
+			stream, &(session->stream_q.list), list) {
+			if (stream->vb2_q == q) {
+				spin_unlock_irqrestore
+					(&(session->stream_q.lock), flags2);
+				spin_unlock_irqrestore
+					(&msm_session_q->lock, flags1);
+				return stream;
+			}
+		}
+		spin_unlock_irqrestore(&(session->stream_q.lock), flags2);
+	}
+	spin_unlock_irqrestore(&msm_session_q->lock, flags1);
+	return NULL;
+}
+
 static struct v4l2_subdev *msm_sd_find(const char *name)
 {
 	unsigned long flags;
 	struct v4l2_subdev *subdev = NULL;
+	struct v4l2_subdev *subdev_out = NULL;
 
 	spin_lock_irqsave(&msm_v4l2_dev->lock, flags);
 	if (!list_empty(&msm_v4l2_dev->subdevs)) {
 		list_for_each_entry(subdev, &msm_v4l2_dev->subdevs, list)
-			if (!strcmp(name, subdev->name))
+			if (!strcmp(name, subdev->name)) {
+				subdev_out = subdev;
 				break;
+			}
 	}
 	spin_unlock_irqrestore(&msm_v4l2_dev->lock, flags);
 
-	return subdev;
+	return subdev_out;
 }
 
 static void msm_sd_notify(struct v4l2_subdev *sd,
@@ -923,7 +1000,7 @@ static void msm_sd_notify(struct v4l2_subdev *sd,
 	}
 }
 
-static int __devinit msm_probe(struct platform_device *pdev)
+static int msm_probe(struct platform_device *pdev)
 {
 	struct msm_video_device *pvdev;
 	int rc = 0;
@@ -1005,7 +1082,7 @@ static int __devinit msm_probe(struct platform_device *pdev)
 	msm_init_queue(msm_session_q);
 	spin_lock_init(&msm_eventq_lock);
 	spin_lock_init(&msm_pid_lock);
-
+	INIT_LIST_HEAD(&ordered_sd_list);
 	goto probe_end;
 
 v4l2_fail:
@@ -1016,20 +1093,21 @@ register_fail:
 entity_fail:
 	media_device_unregister(msm_v4l2_dev->mdev);
 media_fail:
-	kfree(msm_v4l2_dev->mdev);
+	kzfree(msm_v4l2_dev->mdev);
 mdev_fail:
 #endif
 	video_device_release(pvdev->vdev);
 video_fail:
-	kfree(pvdev);
+	kzfree(pvdev);
 pvdev_fail:
-	kfree(msm_v4l2_dev);
+	kzfree(msm_v4l2_dev);
 probe_end:
 	return rc;
 }
 
 static const struct of_device_id msm_dt_match[] = {
 	{.compatible = "qcom,msm-cam"},
+	{}
 }
 
 MODULE_DEVICE_TABLE(of, msm_dt_match);

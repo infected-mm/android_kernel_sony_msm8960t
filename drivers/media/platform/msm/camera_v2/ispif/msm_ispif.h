@@ -1,4 +1,4 @@
-/* Copyright (c) 2013, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2013-2015, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -18,6 +18,8 @@
 #include <media/v4l2-subdev.h>
 #include <media/msmb_ispif.h>
 #include "msm_sd.h"
+
+#define ISPIF_CLK_INFO_MAX 24
 
 struct ispif_irq_status {
 	uint32_t ispifIrqStatus0;
@@ -42,18 +44,27 @@ struct ispif_device {
 	struct platform_device *pdev;
 	struct msm_sd_subdev msm_sd;
 	struct resource *mem;
+	struct resource *clk_mux_mem;
 	struct resource *irq;
 	struct resource *io;
+	struct resource *clk_mux_io;
 	void __iomem *base;
+	void __iomem *clk_mux_base;
 	struct mutex mutex;
 	uint8_t start_ack_pending;
-	struct completion reset_complete;
 	uint32_t csid_version;
 	int enb_dump_reg;
 	uint32_t open_cnt;
 	struct ispif_sof_count sof_count[VFE_MAX];
 	struct ispif_intf_cmd applied_intf_cmd[VFE_MAX];
 	enum msm_ispif_state_t ispif_state;
-	struct clk *ispif_clk[INTF_MAX];
+	struct msm_ispif_vfe_info vfe_info;
+	struct clk *ahb_clk[ISPIF_CLK_INFO_MAX];
+	struct clk *clk[ISPIF_CLK_INFO_MAX];
+	struct completion reset_complete[VFE_MAX];
+	uint32_t hw_num_isps;
+	uint32_t num_ahb_clk;
+	uint32_t num_clk;
+	uint32_t clk_idx;
 };
 #endif
